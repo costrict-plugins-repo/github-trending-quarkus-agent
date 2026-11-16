@@ -1,0 +1,452 @@
+package io.quarkus.agent.mcp;
+
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+import java.io.File;
+import java.io.IOException;
+import java.net.ServerSocket;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Properties;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import org.eclipse.microprofile.config.inject.ConfigProperty;
+import org.eclipse.microprofile.context.ManagedExecutor;
+import org.jboss.logging.Logger;
+
+/**
+ * Manages Quarkus dev mode child processes.
+ * Each project directory maps to at most one running instance.
+ */
+@ApplicationScoped
+public class QuarkusProcessManager {
+
+    private static final Logger LOG = Logger.getLogger(QuarkusProcessManager.class);
+
+    private final ConcurrentHashMap<String, QuarkusInstance> instances = new ConcurrentHashMap<>();
+
+    @Inject
+    ManagedExecutor executor;
+
+    @ConfigProperty(name = "agent-mcp.mode", defaultValue = "dev")
+    String mode;
+
+    @ConfigProperty(name = "agent-mcp.process.gradle-cmd")
+    Optional<String> gradleCmd;
+
+    @ConfigProperty(name = "agent-mcp.extra-args")
+    Optional<String> configExtraArgs;
+
+    @ConfigProperty(name = "agent-mcp.app-log.enabled")
+    Optional<Boolean> appLogEnabled;
+
+    public String getMode() {
+        return mode;
+    }
+
+    public boolean isDevMode() {
+        return "dev".equals(mode);
+    }
+
+    @PostConstruct
+    void validateMode() {
+        if (!VALID_MODES.contains(mode)) {
+            throw new IllegalStateException(
+                    "Invalid agent-mcp.mode: '" + mode + "'. Must be one of: " + VALID_MODES);
+        }
+    }
+
+    private static final Set<String> VALID_MODES = Set.of("dev", "test", "prod");
+    private static final Set<String> VALID_BUILD_TOOLS = Set.of("maven", "gradle");
+    static final int DEFAULT_HTTP_PORT = 8080;
+    private static final int MAX_PORT_SCAN = 100;
+
+    public synchronized Integer start(String projectDir, String buildTool, Integer httpPort, String mavenProfiles) {
+        return start(projectDir, buildTool, httpPort, mavenProfiles, null);
+    }
+
+    public synchronized Integer start(String projectDir, String buildTool, Integer httpPort, String mavenProfiles, String extraArgs) {
+        if (buildTool != null && !VALID_BUILD_TOOLS.contains(buildTool.toLowerCase())) {
+            throw new IllegalArgumentException(
+                    "Invalid build tool: '" + buildTool + "'. Must be 'maven' or 'gradle'.");
+        }
+        if (httpPort != null) {
+            validatePort(httpPort);
+        }
+        String normalizedDir = normalize(projectDir);
+
+        QuarkusInstance existing = instances.get(normalizedDir);
+        if (existing != null) {
+            if (existing.isAlive()) {
+                throw new IllegalStateException("Quarkus instance already running at: " + normalizedDir);
+            }
+            // Clean up dead instance before starting a new one
+            instances.remove(normalizedDir);
+            LOG.infof("Cleaned up dead instance at: %s", normalizedDir);
+        }
+
+        Integer effectivePort = httpPort;
+        if (effectivePort == null && !isPortAvailable(DEFAULT_HTTP_PORT)) {
+            effectivePort = findAvailablePort(DEFAULT_HTTP_PORT);
+            LOG.infof("Default port %d is in use, using port %d instead", DEFAULT_HTTP_PORT, effectivePort);
+        }
+
+        String detectedBuildTool = buildTool != null ? buildTool : detectBuildTool(normalizedDir);
+        ProcessBuilder pb = createProcessBuilder(normalizedDir, detectedBuildTool, effectivePort, mavenProfiles, extraArgs);
+
+        try {
+            Process process = pb.start();
+            QuarkusInstance instance = new QuarkusInstance(normalizedDir, detectedBuildTool, httpPort, mavenProfiles, extraArgs, process, executor);
+            instances.put(normalizedDir, instance);
+            if (appLogEnabled.orElse(false)) {
+                instance.enableFileLogging(computeLogFile(normalizedDir));
+            }
+            LOG.infof("Started Quarkus %s mode at: %s (build tool: %s)", mode, normalizedDir, detectedBuildTool);
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to start Quarkus " + mode + " mode: " + e.getMessage(), e);
+        }
+        return effectivePort;
+    }
+
+    public synchronized void stop(String projectDir) {
+        String normalizedDir = normalize(projectDir);
+        QuarkusInstance instance = instances.get(normalizedDir);
+        if (instance == null) {
+            throw new IllegalStateException("No Quarkus instance found at: " + normalizedDir);
+        }
+        instance.stop();
+        instances.remove(normalizedDir);
+        LOG.infof("Stopped Quarkus instance at: %s", normalizedDir);
+    }
+
+    public synchronized void restart(String projectDir) {
+        String normalizedDir = normalize(projectDir);
+        QuarkusInstance instance = instances.get(normalizedDir);
+        if (instance == null) {
+            throw new IllegalStateException(
+                    "No Quarkus instance found at: " + normalizedDir + ". Use quarkus_start first.");
+        }
+        if (instance.isExternal()) {
+            throw new IllegalStateException(
+                    "Cannot restart an attached application at: " + normalizedDir
+                            + ". This server does not own the process. "
+                            + "Call devui-logstream_forceRestart via quarkus_callTool instead.");
+        }
+
+        if (isDevMode() && instance.isAlive()) {
+            instance.restart();
+            LOG.infof("Live reload triggered at: %s", normalizedDir);
+        } else {
+            String savedBuildTool = instance.getBuildTool();
+            Integer savedHttpPort = instance.getRequestedHttpPort();
+            String savedMavenProfiles = instance.getMavenProfiles();
+            String savedExtraArgs = instance.getExtraArgs();
+            if (instance.isAlive()) {
+                instance.stop();
+            }
+            instances.remove(normalizedDir);
+            start(normalizedDir, savedBuildTool, savedHttpPort, savedMavenProfiles, savedExtraArgs);
+            LOG.infof("Full restart at: %s", normalizedDir);
+        }
+    }
+
+    /**
+     * Checks that projectDir can be attached to, without registering anything.
+     * Lets a caller reject a bad path before it goes looking for a Dev MCP server on the network.
+     *
+     * @return the normalized project directory
+     */
+    public synchronized String validateAttachable(String projectDir) {
+        String normalizedDir = normalize(projectDir);
+        if (!new File(normalizedDir).isDirectory()) {
+            throw new IllegalArgumentException("Not a directory: " + projectDir);
+        }
+        // Throws if there is no pom.xml or build.gradle, i.e. this is not a Quarkus project.
+        detectBuildTool(normalizedDir);
+        QuarkusInstance existing = instances.get(normalizedDir);
+        if (existing != null && existing.isAlive()) {
+            throw new IllegalStateException("A Quarkus instance is already registered at: " + normalizedDir);
+        }
+        return normalizedDir;
+    }
+
+    /**
+     * Registers an application that is already running outside this server, so the Dev MCP
+     * proxy tools can reach it. No process is started and none is owned.
+     */
+    public synchronized void register(String projectDir, int httpPort) {
+        validatePort(httpPort);
+        String normalizedDir = validateAttachable(projectDir);
+        registerNormalized(normalizedDir, httpPort);
+    }
+
+    /**
+     * Like {@link #register} but accepts a directory path that has already been normalized and
+     * validated by {@link #validateAttachable}. Used by the attach tool to avoid a second
+     * redundant validation round-trip.
+     */
+    synchronized void registerNormalized(String normalizedDir, int httpPort) {
+        registerNormalized(normalizedDir, httpPort, null);
+    }
+
+    synchronized void registerNormalized(String normalizedDir, int httpPort, String devMcpPath) {
+        instances.put(normalizedDir, new QuarkusInstance(normalizedDir, httpPort, devMcpPath));
+        if (devMcpPath != null) {
+            LOG.infof("Attached to external Quarkus instance at: %s (port: %d, devMcpPath: %s)", normalizedDir,
+                    httpPort, devMcpPath);
+        } else {
+            LOG.infof("Attached to external Quarkus instance at: %s (port: %d)", normalizedDir, httpPort);
+        }
+    }
+
+    public QuarkusInstance getInstance(String projectDir) {
+        return instances.get(normalize(projectDir));
+    }
+
+    public Map<String, String> listInstances() {
+        Map<String, String> result = new LinkedHashMap<>();
+        for (Map.Entry<String, QuarkusInstance> entry : instances.entrySet()) {
+            result.put(entry.getKey(), entry.getValue().getStatus().name().toLowerCase());
+        }
+        return result;
+    }
+
+    @PreDestroy
+    void stopAll() {
+        for (Map.Entry<String, QuarkusInstance> entry : instances.entrySet()) {
+            try {
+                entry.getValue().stop();
+                LOG.infof("Stopped instance at: %s", entry.getKey());
+            } catch (Exception e) {
+                LOG.errorf("Error stopping instance at %s: %s", entry.getKey(), e.getMessage());
+            }
+        }
+        instances.clear();
+    }
+
+    static void validatePort(int httpPort) {
+        if (httpPort < 1 || httpPort > 65535) {
+            throw new IllegalArgumentException(
+                    "Invalid HTTP port: " + httpPort + ". Must be between 1 and 65535.");
+        }
+    }
+
+    private String normalize(String projectDir) {
+        if (projectDir == null || projectDir.isBlank()) {
+            throw new IllegalArgumentException("projectDir must not be null or empty.");
+        }
+        try {
+            return new File(projectDir).getCanonicalPath();
+        } catch (IOException e) {
+            return new File(projectDir).getAbsolutePath();
+        }
+    }
+
+    private String detectBuildTool(String projectDir) {
+        File dir = new File(projectDir);
+        if (new File(dir, "pom.xml").exists()) {
+            return "maven";
+        } else if (new File(dir, "build.gradle").exists() || new File(dir, "build.gradle.kts").exists()) {
+            return "gradle";
+        }
+        throw new IllegalArgumentException(
+                "Cannot detect build tool at: " + projectDir + ". No pom.xml or build.gradle found.");
+    }
+
+    private ProcessBuilder createProcessBuilder(String projectDir, String buildTool, Integer httpPort, String mavenProfiles, String extraArgs) {
+        File dir = new File(projectDir);
+        if (!dir.isDirectory()) {
+            throw new IllegalArgumentException("Not a directory: " + projectDir);
+        }
+
+        ProcessBuilder pb;
+        File workDir = dir;
+        if ("gradle".equalsIgnoreCase(buildTool)) {
+            pb = createGradleProcessBuilder(dir);
+        } else {
+            // A module of a Maven reactor is started from the reactor root with -pl <module> -am,
+            // so its sibling modules are built from source instead of resolved from ~/.m2.
+            Path reactorRoot = isDevMode() ? MavenReactor.findRoot(dir.toPath()).orElse(null) : null;
+            if (reactorRoot != null) {
+                workDir = reactorRoot.toFile();
+            }
+            pb = createMavenProcessBuilder(dir, reactorRoot, mavenProfiles);
+        }
+
+        if (httpPort != null) {
+            pb.command().add("-Dquarkus.http.port=" + httpPort);
+            pb.command().add("-Dquarkus.http.test-port=0");
+        }
+
+        configExtraArgs.filter(s -> !s.isBlank()).ifPresent(args -> {
+            for (String token : args.trim().split("\\s+")) {
+                pb.command().add(token);
+            }
+        });
+
+        if (extraArgs != null && !extraArgs.isBlank()) {
+            for (String token : extraArgs.trim().split("\\s+")) {
+                pb.command().add(token);
+            }
+        }
+
+        pb.directory(workDir);
+        pb.redirectErrorStream(false);
+        return pb;
+    }
+
+    private ProcessBuilder createMavenProcessBuilder(File projectDir, Path reactorRoot, String mavenProfiles) {
+        String mvnCmd = ProcessUtils.resolveMavenCommand(reactorRoot != null ? reactorRoot.toFile() : projectDir);
+        var command = new ArrayList<String>();
+        command.add(mvnCmd);
+        if (isDevMode()) {
+            if (reactorRoot != null) {
+                LOG.infof("%s is a module of the Maven reactor at %s", projectDir, reactorRoot);
+                command.add(MavenReactor.devGoal(projectDir.toPath(), reactorRoot));
+                command.addAll(List.of("-pl", reactorRoot.relativize(projectDir.toPath()).toString(), "-am"));
+            } else {
+                command.add("quarkus:dev");
+            }
+            command.addAll(List.of("-Dquarkus.console.enabled=false", "-Dquarkus.analytics.disabled=true",
+                    "-Dquarkus.dev-mcp.enabled=true"));
+        } else {
+            command.add("quarkus:run");
+            if ("test".equals(mode)) {
+                command.add("-Dquarkus.profile=test");
+            }
+        }
+        if (mavenProfiles != null && !mavenProfiles.isBlank()) {
+            command.add("-P" + mavenProfiles.trim());
+        }
+        return new ProcessBuilder(command);
+    }
+
+    private ProcessBuilder createGradleProcessBuilder(File projectDir) {
+        String cmd = gradleCmd.orElseGet(() -> ProcessUtils.resolveGradleCommand(projectDir));
+        if (isDevMode()) {
+            return new ProcessBuilder(cmd, "quarkusDev",
+                    "-Dquarkus.console.enabled=false", "-Dquarkus.analytics.disabled=true",
+                    "-Dquarkus.dev-mcp.enabled=true");
+        }
+        var command = new ArrayList<>(List.of(cmd, "quarkusRun"));
+        if ("test".equals(mode)) {
+            command.add("-Dquarkus.profile=test");
+        }
+        return new ProcessBuilder(command);
+    }
+
+    static boolean isPortAvailable(int port) {
+        try (ServerSocket ss = new ServerSocket(port)) {
+            return true;
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    static int findAvailablePort(int startPort) {
+        for (int port = startPort + 1; port <= startPort + MAX_PORT_SCAN; port++) {
+            if (isPortAvailable(port)) {
+                return port;
+            }
+        }
+        throw new IllegalStateException(
+                "Could not find an available port in range " + (startPort + 1) + "-" + (startPort + MAX_PORT_SCAN)
+                        + ". Specify a port explicitly using the httpPort parameter.");
+    }
+
+    static Path computeLogFile(String projectDir) {
+        String dirName = Path.of(projectDir).getFileName().toString();
+        return Path.of(System.getProperty("user.home"), ".quarkus", "apps", dirName, "quarkus-dev.log");
+    }
+
+    /**
+     * Best-effort guess at the port an already-running application listens on, read from
+     * application.properties. The dev profile wins, since attaching only applies to dev mode.
+     *
+     * <p>A port set on the command line, in a YAML config file, or in an environment variable is
+     * invisible here, so callers must verify the guess rather than trust it, and users can always
+     * pass the port explicitly.
+     */
+    static int detectHttpPort(String projectDir) {
+        Path file = Path.of(projectDir, "src", "main", "resources", "application.properties");
+        if (!Files.exists(file)) {
+            return DEFAULT_HTTP_PORT;
+        }
+        Properties props = new Properties();
+        try (var reader = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
+            props.load(reader);
+        } catch (IOException e) {
+            LOG.debugf("Could not read %s: %s", file, e.getMessage());
+            return DEFAULT_HTTP_PORT;
+        }
+        for (String key : new String[] { "%dev.quarkus.http.port", "quarkus.http.port" }) {
+            String val = props.getProperty(key);
+            if (val == null || val.isBlank()) {
+                continue;
+            }
+            try {
+                return Integer.parseInt(val.trim());
+            } catch (NumberFormatException e) {
+                // A config expression such as ${PORT:8080}, or a typo. Fall through to the default.
+                LOG.debugf("Ignoring non-numeric %s: '%s'", key, val);
+            }
+        }
+        return DEFAULT_HTTP_PORT;
+    }
+
+    /**
+     * Best-effort guess at the Dev MCP endpoint path for an already-running application,
+     * read from application.properties. Resolves quarkus.http.non-application-root-path
+     * against quarkus.http.root-path when relative, falling back to /q/dev-mcp.
+     */
+    static String detectDevMcpPath(String projectDir) {
+        Path file = Path.of(projectDir, "src", "main", "resources", "application.properties");
+        if (!Files.exists(file)) {
+            return QuarkusInstance.DEFAULT_DEV_MCP_PATH;
+        }
+        Properties props = new Properties();
+        try (var reader = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
+            props.load(reader);
+        } catch (IOException e) {
+            LOG.debugf("Could not read %s: %s", file, e.getMessage());
+            return QuarkusInstance.DEFAULT_DEV_MCP_PATH;
+        }
+
+        String rootPath = getProperty(props, "%dev.quarkus.http.root-path", "quarkus.http.root-path");
+        String nonAppRootPath = getProperty(props, "%dev.quarkus.http.non-application-root-path",
+                "quarkus.http.non-application-root-path");
+
+        return buildDevMcpPath(rootPath, nonAppRootPath);
+    }
+
+    private static String getProperty(Properties props, String... keys) {
+        for (String key : keys) {
+            String val = props.getProperty(key);
+            if (val != null && !val.isBlank()) {
+                String trimmed = val.trim();
+                if (trimmed.contains("${")) {
+                    LOG.debugf("Ignoring config expression in %s: '%s'", key, val);
+                    continue;
+                }
+                return trimmed;
+            }
+        }
+        return null;
+    }
+
+    static String buildDevMcpPath(String rootPath, String nonAppRootPath) {
+        String nonApp = (nonAppRootPath != null && !nonAppRootPath.isBlank()) ? nonAppRootPath.trim() : "q";
+        String root = (rootPath != null && !rootPath.isBlank()) ? rootPath.trim() : "/";
+        String basePath = nonApp.startsWith("/") ? nonApp : (root + "/" + nonApp);
+        return ("/" + basePath + "/dev-mcp").replaceAll("/+", "/");
+    }
+
+}
